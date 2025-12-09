@@ -6,7 +6,8 @@
 // - Diffs before/after (using PII-redacted copies for Slack)
 // - Categorised Slack alerts in ONE channel
 // - Soft Slack rate limiting per resource
-// - Flags possible abandoned checkouts (non-Plus compatible)
+// - Flags possible abandoned checkouts
+// - Flags possible card testing on orders (transaction failures)
 // - Avoids exposing PII in Slack for customers/orders/checkouts
 //
 // ENV VARS:
@@ -15,9 +16,6 @@
 //   SHOPIFY_ACCESS_TOKEN    - Admin API access token (shpat_...)
 //   SHOPIFY_API_VERSION     - e.g. "2025-01"
 //   ENABLE_ACTOR_LOOKUP     - "1" to enable Events API actor lookup
-//
-// Optional: Vercel KV integration (@vercel/kv).
-//   If not present, falls back to in-memory (non-persistent).
 
 const crypto = require("crypto");
 
@@ -32,7 +30,7 @@ try {
   );
 }
 
-// Fallback in-memory store for dev / when KV not enabled
+// Fallback in-memory store
 const memoryStore = new Map();
 
 async function getSnapshot(key) {
@@ -108,27 +106,46 @@ function isEqual(a, b) {
 
 function summarizeValue(value) {
   if (value === null || value === undefined) return String(value);
+
+  // Strings
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed.length > 240) {
-      // show both ends for large HTML / bodies
       return `${trimmed.slice(0, 180)} … ${trimmed.slice(-40)}`;
     }
     return trimmed;
   }
-  if (Array.isArray(value)) return `[Array(${value.length})]`;
-  if (typeof value === "object") return "[Object]";
+
+  // Arrays: show JSON content (truncated) so variants etc. are visible
+  if (Array.isArray(value)) {
+    try {
+      const json = JSON.stringify(value, null, 2);
+      const limit = 1500;
+      if (json.length > limit) {
+        return json.slice(0, limit) + "\n… (truncated)";
+      }
+      return json;
+    } catch {
+      return `[Array(${value.length})]`;
+    }
+  }
+
+  // Objects
+  if (typeof value === "object") {
+    return "[Object]";
+  }
+
+  // Numbers, booleans, etc.
   return String(value);
 }
 
 // ---- PII redaction for Slack-facing diffs ----------------------------------
 
-// We keep full payloads in snapshots, but we compute diffs against
-// a redacted copy to avoid leaking PII (names, emails, addresses, etc.)
+// Full payloads go into snapshots.
+// For diffs/Slack, we run a redaction pass to strip PII.
 function redactForSlack(resourceType, payload) {
   if (!payload || typeof payload !== "object") return payload;
 
-  // Deep-clone via JSON; good enough for webhook payloads
   const clone = JSON.parse(JSON.stringify(payload));
 
   const SENSITIVE_KEYS = new Set([
@@ -158,17 +175,14 @@ function redactForSlack(resourceType, payload) {
 
   function scrub(obj) {
     if (!obj || typeof obj !== "object") return;
-
     if (Array.isArray(obj)) {
       for (const item of obj) scrub(item);
       return;
     }
-
     for (const key of Object.keys(obj)) {
       const value = obj[key];
 
       if (SENSITIVE_KEYS.has(key)) {
-        // For embedded customer objects, we keep just the ID if present
         if (key === "customer" && value && typeof value === "object") {
           obj[key] = value.id
             ? { id: value.id, note: "[REDACTED CUSTOMER OBJECT]" }
@@ -179,15 +193,12 @@ function redactForSlack(resourceType, payload) {
         continue;
       }
 
-      // For customer resources, also treat "name" as sensitive
       if (resourceType === "customers" && key === "name") {
         obj[key] = "[REDACTED]";
         continue;
       }
 
-      if (typeof value === "object") {
-        scrub(value);
-      }
+      if (typeof value === "object") scrub(value);
     }
   }
 
@@ -197,16 +208,11 @@ function redactForSlack(resourceType, payload) {
 
 // ---- Diffing ---------------------------------------------------------------
 
-// Recursively diff two objects. Returns array of { path, before, after }.
 function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
-  if (depth > 4) {
-    // stop very deep recursion
-    return changes;
-  }
+  if (depth > 4) return changes;
 
   if (before === undefined && after === undefined) return changes;
 
-  // Primitive or simple value change
   if (
     typeof before !== "object" ||
     before === null ||
@@ -223,7 +229,6 @@ function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
     return changes;
   }
 
-  // Arrays: treat as a single unit (just mark that it changed)
   if (Array.isArray(before) || Array.isArray(after)) {
     if (!isEqual(before, after)) {
       changes.push({
@@ -235,7 +240,6 @@ function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
     return changes;
   }
 
-  // Objects
   const keys = new Set([
     ...Object.keys(before || {}),
     ...Object.keys(after || {}),
@@ -243,7 +247,7 @@ function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
 
   for (const key of keys) {
     if (["updated_at", "created_at", "admin_graphql_api_id"].includes(key)) {
-      continue; // ignore noisy timestamps / ids
+      continue;
     }
     const nextPath = pathPrefix ? `${pathPrefix}.${key}` : key;
     diffObjects(
@@ -289,7 +293,6 @@ function getResourceId(resourceType, payload) {
       return payload.inventory_item_id || payload.id || null;
 
     case "app":
-      // app/uninstalled – treat as shop-level
       return payload.id || payload.domain || "shop";
 
     default:
@@ -304,7 +307,6 @@ function buildSnapshotKey(resourceType, resourceId, shopDomain) {
 function getDisplayName(resourceType, payload) {
   if (!payload) return "Unknown";
 
-  // Avoid PII in Slack title:
   if (resourceType === "customers") {
     return `Customer ${payload.id || ""}`.trim();
   }
@@ -315,7 +317,6 @@ function getDisplayName(resourceType, payload) {
     return `Order ${payload.id || ""}`.trim();
   }
 
-  // Everything else: safe to show title/name
   return (
     payload.title ||
     payload.name ||
@@ -364,7 +365,6 @@ function getSlackCategory(resourceType) {
 }
 
 function buildSlackTitle(resourceType, action, categoryKey) {
-  // e.g. [PRODUCT][UPDATE]
   return `[${categoryKey}][${action.toUpperCase()}]`;
 }
 
@@ -398,7 +398,7 @@ async function lookupActor(shopDomain, resourceType, resourceId) {
     themes: "Theme",
     discounts: "DiscountCode",
     checkouts: "Checkout",
-    app: "Shop", // approximate for app/uninstalled
+    app: "Shop",
   };
 
   const subjectType = map[resourceType];
@@ -441,9 +441,6 @@ async function lookupActor(shopDomain, resourceType, resourceId) {
 
 // ---- Slack rate limiting helper --------------------------------------------
 
-// Keep a small timestamp per resource/action to avoid spamming Slack
-// e.g. don't alert more than once every 30s for the same product, or
-// once every 5m for the same checkout.
 async function shouldSkipSlackForRateLimit(rateKey, windowMs) {
   const rlKey = `ratelimit/${rateKey}`;
   const record = await getSnapshot(rlKey);
@@ -452,7 +449,7 @@ async function shouldSkipSlackForRateLimit(rateKey, windowMs) {
   if (record && record.lastAt) {
     const last = new Date(record.lastAt).getTime();
     if (!Number.isNaN(last) && now - last < windowMs) {
-      return true; // skip
+      return true;
     }
   }
 
@@ -460,10 +457,8 @@ async function shouldSkipSlackForRateLimit(rateKey, windowMs) {
   return false;
 }
 
-// ---- Checkout "possible abandoned" classification --------------------------
+// ---- Checkout abandonment classification -----------------------------------
 
-// Best-effort: flags checkouts that are "old & still incomplete".
-// This does NOT require Plus; just uses webhook payload fields.
 function classifyCheckoutStatus(payload) {
   if (!payload) return null;
 
@@ -477,11 +472,46 @@ function classifyCheckoutStatus(payload) {
 
   const ageMinutes = (Date.now() - createdAt) / 60000;
 
-  // Adjust threshold as you like – 30 mins is a reasonable starting point.
   if (!completedAt && !orderId && ageMinutes >= 30) {
     return {
       flag: "POSSIBLE_ABANDONED",
       ageMinutes: Math.round(ageMinutes),
+    };
+  }
+
+  return null;
+}
+
+// ---- Card testing suspicion classification ---------------------------------
+
+function classifyCardTesting(resourceType, payload) {
+  if (resourceType !== "orders" || !payload) return null;
+
+  const txs = Array.isArray(payload.transactions)
+    ? payload.transactions
+    : [];
+
+  if (txs.length < 4) return null; // need a few attempts
+
+  const failed = txs.filter((t) => {
+    const status = (t.status || "").toLowerCase();
+    return status === "error" || status === "failure" || !!t.error_code;
+  });
+
+  if (failed.length >= 3 && failed.length / txs.length >= 0.6) {
+    const gateways = [
+      ...new Set(
+        txs
+          .map((t) => t.gateway || t.gateway_name)
+          .filter(Boolean)
+      ),
+    ];
+
+    return {
+      flag: "POSSIBLE_CARD_TESTING",
+      totalTransactions: txs.length,
+      failedTransactions: failed.length,
+      gateways,
     };
   }
 
@@ -497,7 +527,6 @@ module.exports = async (req, res) => {
     return res.end("Method not allowed");
   }
 
-  // 1. Read raw body for HMAC verification
   let rawBody;
   try {
     rawBody = await getRawBody(req);
@@ -515,14 +544,12 @@ module.exports = async (req, res) => {
   const shopDomain =
     req.headers["x-shopify-shop-domain"] || "unknown_shop";
 
-  // 2. HMAC validation
   if (!isValidShopifyHmac(rawBody, hmacHeader)) {
     console.warn("Invalid HMAC for webhook", { shopDomain, topic });
     res.statusCode = 401;
     return res.end("Invalid signature");
   }
 
-  // 3. Parse JSON payload
   let payload;
   try {
     payload = JSON.parse(rawBody.toString("utf8"));
@@ -548,22 +575,11 @@ module.exports = async (req, res) => {
     resourceId,
   });
 
-  // 4. Get previous snapshot
+  // Previous snapshot (full, unredacted)
   const previousSnapshot = await getSnapshot(snapshotKey);
   const previousData = previousSnapshot ? previousSnapshot.data : null;
 
-  // 5. Build redacted copies for Slack-facing diffs
-  const safeCurrent = redactForSlack(resourceType, payload);
-  const safePrevious = previousData
-    ? redactForSlack(resourceType, previousData)
-    : null;
-
-  let changes = [];
-  if (safePrevious) {
-    changes = diffObjects(safePrevious, safeCurrent);
-  }
-
-  // 6. Save new snapshot (full payload, including PII, for forensic use)
+  // Always store current snapshot (full payload) first
   await setSnapshot(snapshotKey, {
     shopDomain,
     topic,
@@ -574,57 +590,81 @@ module.exports = async (req, res) => {
     data: payload,
   });
 
-  // 7. Optional actor lookup
+  // If no previous snapshot: don't send Slack, just remember this as baseline
+  if (!previousData) {
+    res.statusCode = 200;
+    return res.end("OK (baseline snapshot stored)");
+  }
+
+  // Build PII-safe copies for diffing / Slack
+  const safeCurrent = redactForSlack(resourceType, payload);
+  const safePrevious = redactForSlack(resourceType, previousData);
+
+  const changes = diffObjects(safePrevious, safeCurrent);
+
+  // If nothing changed (after redaction), don't send Slack
+  if (!changes.length) {
+    res.statusCode = 200;
+    return res.end("OK (no significant changes)");
+  }
+
+  // Optional actor lookup
   const actor = await lookupActor(shopDomain, resourceType, resourceId);
 
-  // 8. Category + checkout status
   const category = getSlackCategory(resourceType);
   const title = buildSlackTitle(resourceType, action, category.key);
   const resourceName = getDisplayName(resourceType, payload);
 
-  let statusNote = null;
+  const statusNotes = [];
+
   if (resourceType === "checkouts") {
     const statusInfo = classifyCheckoutStatus(payload);
     if (statusInfo && statusInfo.flag === "POSSIBLE_ABANDONED") {
-      statusNote = `*Status:* Possible abandoned checkout (open for ~${statusInfo.ageMinutes} min, no order created yet).`;
+      statusNotes.push(
+        `*Status:* Possible abandoned checkout (open for ~${statusInfo.ageMinutes} min, no order created yet).`
+      );
     }
+  }
+
+  const cardTesting = classifyCardTesting(resourceType, payload);
+  if (cardTesting && cardTesting.flag === "POSSIBLE_CARD_TESTING") {
+    statusNotes.push(
+      `*Status:* Possible card testing detected – ${cardTesting.failedTransactions}/${cardTesting.totalTransactions} failed transactions` +
+        (cardTesting.gateways.length
+          ? ` via gateways: ${cardTesting.gateways.join(", ")}.`
+          : ".")
+    );
   }
 
   const diffLines = [];
-  if (!safePrevious) {
-    diffLines.push("_New resource – no previous snapshot_");
-  } else if (!changes.length) {
-    diffLines.push("_No significant field changes detected_");
-  } else {
-    const maxChanges = 12;
-    for (const change of changes.slice(0, maxChanges)) {
-      const before =
-        "beforeSummary" in change
-          ? change.beforeSummary
-          : summarizeValue(change.before);
-      const after =
-        "afterSummary" in change
-          ? change.afterSummary
-          : summarizeValue(change.after);
 
-      diffLines.push(
-        `• \`${change.path}\`:\n    • Before: ${before}\n    • After:  ${after}`
-      );
-    }
-    if (changes.length > maxChanges) {
-      diffLines.push(
-        `… and ${changes.length - maxChanges} more changes (truncated)`
-      );
-    }
+  if (statusNotes.length) {
+    diffLines.push(...statusNotes);
+    diffLines.push(""); // blank line before field-level diffs
   }
 
-  if (statusNote) {
-    diffLines.unshift(statusNote);
+  const maxChanges = 12;
+  for (const change of changes.slice(0, maxChanges)) {
+    const before =
+      "beforeSummary" in change
+        ? change.beforeSummary
+        : summarizeValue(change.before);
+    const after =
+      "afterSummary" in change
+        ? change.afterSummary
+        : summarizeValue(change.after);
+
+    diffLines.push(
+      `• \`${change.path}\`:\n    • Before:\n${before}\n    • After:\n${after}`
+    );
+  }
+  if (changes.length > maxChanges) {
+    diffLines.push(
+      `… and ${changes.length - maxChanges} more changes (truncated)`
+    );
   }
 
   const slackPayload = {
-    // All in one channel, visually separated:
-    // :credit_card: [CHECKOUT][UPDATE] Order #1234
     text: `${category.emoji} ${title} ${resourceName}`,
     attachments: [
       {
@@ -666,10 +706,8 @@ module.exports = async (req, res) => {
     ],
   };
 
-  // 9. Slack rate limiting per resource/action
   const rateWindowMs =
     resourceType === "checkouts" ? 5 * 60 * 1000 : 30 * 1000;
-
   const rateKey = `${snapshotKey}/${action}`;
 
   const skipSlack = await shouldSkipSlackForRateLimit(
