@@ -1,18 +1,23 @@
 // api/blowes-alerts-monitor.js
 //
 // Shopify monitoring endpoint for Vercel (Node 18).
-// Single URL that accepts multiple webhook topics and sends categorised Slack alerts
-// with diffing and optional actor lookups, plus snapshot storage.
+// - Validates HMAC
+// - Stores snapshots (Vercel KV or in-memory)
+// - Diffs before/after (using PII-redacted copies for Slack)
+// - Categorised Slack alerts in ONE channel
+// - Soft Slack rate limiting per resource
+// - Flags possible abandoned checkouts (non-Plus compatible)
+// - Avoids exposing PII in Slack for customers/orders/checkouts
 //
-// ENV VARS (Vercel → Project → Settings → Environment):
+// ENV VARS:
 //   SHOPIFY_WEBHOOK_SECRET  - API secret key (shpss_...)
-//   SLACK_WEBHOOK_URL       - Incoming Slack webhook URL
+//   SLACK_WEBHOOK_URL       - Slack incoming webhook
 //   SHOPIFY_ACCESS_TOKEN    - Admin API access token (shpat_...)
 //   SHOPIFY_API_VERSION     - e.g. "2025-01"
-//   ENABLE_ACTOR_LOOKUP     - "1" to enable Events API lookups; else "0" or unset
+//   ENABLE_ACTOR_LOOKUP     - "1" to enable Events API actor lookup
 //
-// Optional: Vercel KV integration for persistent snapshots.
-//   Install integration in Vercel UI. If not present, falls back to in-memory map.
+// Optional: Vercel KV integration (@vercel/kv).
+//   If not present, falls back to in-memory (non-persistent).
 
 const crypto = require("crypto");
 
@@ -114,6 +119,80 @@ function summarizeValue(value) {
   if (Array.isArray(value)) return `[Array(${value.length})]`;
   if (typeof value === "object") return "[Object]";
   return String(value);
+}
+
+// ---- PII redaction for Slack-facing diffs ----------------------------------
+
+// We keep full payloads in snapshots, but we compute diffs against
+// a redacted copy to avoid leaking PII (names, emails, addresses, etc.)
+function redactForSlack(resourceType, payload) {
+  if (!payload || typeof payload !== "object") return payload;
+
+  // Deep-clone via JSON; good enough for webhook payloads
+  const clone = JSON.parse(JSON.stringify(payload));
+
+  const SENSITIVE_KEYS = new Set([
+    "email",
+    "first_name",
+    "last_name",
+    "phone",
+    "billing_address",
+    "shipping_address",
+    "default_address",
+    "addresses",
+    "customer",
+    "note",
+    "notes",
+    "billing_address1",
+    "shipping_address1",
+    "address1",
+    "address2",
+    "city",
+    "province",
+    "zip",
+    "postal_code",
+    "country",
+    "browser_ip",
+    "ip",
+  ]);
+
+  function scrub(obj) {
+    if (!obj || typeof obj !== "object") return;
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) scrub(item);
+      return;
+    }
+
+    for (const key of Object.keys(obj)) {
+      const value = obj[key];
+
+      if (SENSITIVE_KEYS.has(key)) {
+        // For embedded customer objects, we keep just the ID if present
+        if (key === "customer" && value && typeof value === "object") {
+          obj[key] = value.id
+            ? { id: value.id, note: "[REDACTED CUSTOMER OBJECT]" }
+            : "[REDACTED CUSTOMER OBJECT]";
+        } else {
+          obj[key] = "[REDACTED]";
+        }
+        continue;
+      }
+
+      // For customer resources, also treat "name" as sensitive
+      if (resourceType === "customers" && key === "name") {
+        obj[key] = "[REDACTED]";
+        continue;
+      }
+
+      if (typeof value === "object") {
+        scrub(value);
+      }
+    }
+  }
+
+  scrub(clone);
+  return clone;
 }
 
 // ---- Diffing ---------------------------------------------------------------
@@ -224,12 +303,23 @@ function buildSnapshotKey(resourceType, resourceId, shopDomain) {
 
 function getDisplayName(resourceType, payload) {
   if (!payload) return "Unknown";
+
+  // Avoid PII in Slack title:
+  if (resourceType === "customers") {
+    return `Customer ${payload.id || ""}`.trim();
+  }
+
+  if (resourceType === "orders" || resourceType === "checkouts") {
+    if (payload.order_number) return `Order #${payload.order_number}`;
+    if (payload.name && typeof payload.name === "string") return payload.name;
+    return `Order ${payload.id || ""}`.trim();
+  }
+
+  // Everything else: safe to show title/name
   return (
     payload.title ||
     payload.name ||
-    payload.email ||
     payload.handle ||
-    payload.order_number ||
     payload.id ||
     "Unknown"
   );
@@ -349,6 +439,55 @@ async function lookupActor(shopDomain, resourceType, resourceId) {
   }
 }
 
+// ---- Slack rate limiting helper --------------------------------------------
+
+// Keep a small timestamp per resource/action to avoid spamming Slack
+// e.g. don't alert more than once every 30s for the same product, or
+// once every 5m for the same checkout.
+async function shouldSkipSlackForRateLimit(rateKey, windowMs) {
+  const rlKey = `ratelimit/${rateKey}`;
+  const record = await getSnapshot(rlKey);
+  const now = Date.now();
+
+  if (record && record.lastAt) {
+    const last = new Date(record.lastAt).getTime();
+    if (!Number.isNaN(last) && now - last < windowMs) {
+      return true; // skip
+    }
+  }
+
+  await setSnapshot(rlKey, { lastAt: new Date().toISOString() });
+  return false;
+}
+
+// ---- Checkout "possible abandoned" classification --------------------------
+
+// Best-effort: flags checkouts that are "old & still incomplete".
+// This does NOT require Plus; just uses webhook payload fields.
+function classifyCheckoutStatus(payload) {
+  if (!payload) return null;
+
+  const completedAt = payload.completed_at;
+  const orderId = payload.order_id;
+  const createdAtStr = payload.created_at;
+  if (!createdAtStr) return null;
+
+  const createdAt = new Date(createdAtStr).getTime();
+  if (Number.isNaN(createdAt)) return null;
+
+  const ageMinutes = (Date.now() - createdAt) / 60000;
+
+  // Adjust threshold as you like – 30 mins is a reasonable starting point.
+  if (!completedAt && !orderId && ageMinutes >= 30) {
+    return {
+      flag: "POSSIBLE_ABANDONED",
+      ageMinutes: Math.round(ageMinutes),
+    };
+  }
+
+  return null;
+}
+
 // ---- Main handler ----------------------------------------------------------
 
 module.exports = async (req, res) => {
@@ -409,16 +548,22 @@ module.exports = async (req, res) => {
     resourceId,
   });
 
-  // 4. Get previous snapshot & compute diffs
+  // 4. Get previous snapshot
   const previousSnapshot = await getSnapshot(snapshotKey);
   const previousData = previousSnapshot ? previousSnapshot.data : null;
 
+  // 5. Build redacted copies for Slack-facing diffs
+  const safeCurrent = redactForSlack(resourceType, payload);
+  const safePrevious = previousData
+    ? redactForSlack(resourceType, previousData)
+    : null;
+
   let changes = [];
-  if (previousData) {
-    changes = diffObjects(previousData, payload);
+  if (safePrevious) {
+    changes = diffObjects(safePrevious, safeCurrent);
   }
 
-  // 5. Save new snapshot
+  // 6. Save new snapshot (full payload, including PII, for forensic use)
   await setSnapshot(snapshotKey, {
     shopDomain,
     topic,
@@ -429,16 +574,24 @@ module.exports = async (req, res) => {
     data: payload,
   });
 
-  // 6. Optional actor lookup
+  // 7. Optional actor lookup
   const actor = await lookupActor(shopDomain, resourceType, resourceId);
 
-  // 7. Build Slack message with category separation
+  // 8. Category + checkout status
   const category = getSlackCategory(resourceType);
   const title = buildSlackTitle(resourceType, action, category.key);
   const resourceName = getDisplayName(resourceType, payload);
 
+  let statusNote = null;
+  if (resourceType === "checkouts") {
+    const statusInfo = classifyCheckoutStatus(payload);
+    if (statusInfo && statusInfo.flag === "POSSIBLE_ABANDONED") {
+      statusNote = `*Status:* Possible abandoned checkout (open for ~${statusInfo.ageMinutes} min, no order created yet).`;
+    }
+  }
+
   const diffLines = [];
-  if (!previousData) {
+  if (!safePrevious) {
     diffLines.push("_New resource – no previous snapshot_");
   } else if (!changes.length) {
     diffLines.push("_No significant field changes detected_");
@@ -465,9 +618,13 @@ module.exports = async (req, res) => {
     }
   }
 
+  if (statusNote) {
+    diffLines.unshift(statusNote);
+  }
+
   const slackPayload = {
-    // Searchable + category-separated inside one channel:
-    // :package: [PRODUCT][UPDATE] Product Title
+    // All in one channel, visually separated:
+    // :credit_card: [CHECKOUT][UPDATE] Order #1234
     text: `${category.emoji} ${title} ${resourceName}`,
     attachments: [
       {
@@ -509,7 +666,22 @@ module.exports = async (req, res) => {
     ],
   };
 
-  await sendSlack(slackPayload);
+  // 9. Slack rate limiting per resource/action
+  const rateWindowMs =
+    resourceType === "checkouts" ? 5 * 60 * 1000 : 30 * 1000;
+
+  const rateKey = `${snapshotKey}/${action}`;
+
+  const skipSlack = await shouldSkipSlackForRateLimit(
+    rateKey,
+    rateWindowMs
+  );
+
+  if (skipSlack) {
+    console.log("Rate-limited Slack alert", { rateKey, resourceType, action });
+  } else {
+    await sendSlack(slackPayload);
+  }
 
   res.statusCode = 200;
   res.end("OK");
