@@ -1,24 +1,72 @@
 // api/blowes-alerts-monitor.js
-// Minimal version: never sends Slack if there is no previous snapshot.
+// Shopify monitor with:
+// - Baseline snapshots (no Slack on first event unless fraud)
+// - Before/After diffs for all resources
+// - Full payloads stored in memory (PII included)
+// - PII masked in Slack for normal events
+// - Extra fraud/card-testing heuristic for orders & checkouts
 
 const crypto = require("crypto");
 
-// --- Config ---
+// === CONFIG ===
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || null;
 
-// in-memory snapshots (you can switch to @vercel/kv later if you want)
-const memoryStore = new Map();
+// In-memory snapshot store (swap to KV later if you want persistence)
+const snapshotStore = new Map();
+
+// In-memory fraud tracker
+// Key: identifier (email|ip|cart_token)
+// Value: array of timestamps (ms)
+const fraudTracker = new Map();
+
+// Topics where payloads contain heavy PII:
+const PII_TOPICS = new Set([
+  "orders/create",
+  "orders/updated",
+  "orders/paid",
+  "orders/cancelled",
+  "checkouts/create",
+  "checkouts/update",
+  "customers/create",
+  "customers/update",
+]);
+
+// (Optional grouping; not strictly needed but kept for clarity)
+const CONTENT_TOPICS = new Set([
+  "products/create",
+  "products/update",
+  "products/delete",
+  "collections/create",
+  "collections/update",
+  "collections/delete",
+  "pages/create",
+  "pages/update",
+  "pages/delete",
+  "articles/create",
+  "articles/update",
+  "articles/delete",
+  "themes/publish",
+  "themes/update",
+  "inventory_levels/update",
+  "discounts/create",
+  "discounts/update",
+  "discounts/delete",
+  "app/uninstalled",
+]);
+
+// === SNAPSHOT HELPERS ===
 
 async function getSnapshot(key) {
-  return memoryStore.get(key) || null;
+  return snapshotStore.get(key) || null;
 }
 
-async function setSnapshot(key, value) {
-  memoryStore.set(key, value);
+async function setSnapshot(key, snapshot) {
+  snapshotStore.set(key, snapshot);
 }
 
-// --- Helpers ---
+// === BASIC HELPERS ===
+
 function getRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -35,30 +83,11 @@ function isValidShopifyHmac(rawBody, hmacHeader) {
     .update(rawBody)
     .digest("base64");
 
-  const b1 = Buffer.from(digest, "utf8");
-  const b2 = Buffer.from(hmacHeader, "utf8");
-  if (b1.length !== b2.length) return false;
-  return crypto.timingSafeEqual(b1, b2);
-}
+  const sigBuf = Buffer.from(digest, "utf8");
+  const hdrBuf = Buffer.from(hmacHeader, "utf8");
 
-function summarize(value) {
-  if (value === null || value === undefined) return String(value);
-  if (typeof value === "string") {
-    const t = value.trim();
-    if (t.length > 240) return `${t.slice(0, 180)} … ${t.slice(-40)}`;
-    return t;
-  }
-  if (Array.isArray(value)) {
-    try {
-      const json = JSON.stringify(value, null, 2);
-      const limit = 1500;
-      return json.length > limit ? json.slice(0, limit) + "\n… (truncated)" : json;
-    } catch {
-      return `[Array(${value.length})]`;
-    }
-  }
-  if (typeof value === "object") return "[Object]";
-  return String(value);
+  if (sigBuf.length !== hdrBuf.length) return false;
+  return crypto.timingSafeEqual(sigBuf, hdrBuf);
 }
 
 function parseTopic(topic) {
@@ -75,6 +104,86 @@ function getResourceId(resourceType, payload) {
 function buildSnapshotKey(resourceType, resourceId, shopDomain) {
   return `${shopDomain || "shop"}/${resourceType}/${resourceId || "unknown"}`;
 }
+
+function summarize(value) {
+  if (value === null || value === undefined) return String(value);
+
+  if (typeof value === "string") {
+    const t = value.trim();
+    if (t.length > 240) return `${t.slice(0, 180)} … ${t.slice(-40)}`;
+    return t;
+  }
+
+  if (Array.isArray(value)) {
+    try {
+      const json = JSON.stringify(value, null, 2);
+      const limit = 1500;
+      return json.length > limit ? json.slice(0, limit) + "\n… (truncated)" : json;
+    } catch {
+      return `[Array(${value.length})]`;
+    }
+  }
+
+  if (typeof value === "object") {
+    try {
+      const json = JSON.stringify(value, null, 2);
+      if (json.length > 1500) return json.slice(0, 1500) + "\n… (truncated)";
+      return json;
+    } catch {
+      return "[Object]";
+    }
+  }
+
+  return String(value);
+}
+
+// === PII MASKING ===
+
+const PII_KEYS = new Set([
+  "email",
+  "phone",
+  "first_name",
+  "last_name",
+  "name",
+  "address1",
+  "address2",
+  "city",
+  "province",
+  "zip",
+  "postal_code",
+  "country",
+  "company",
+]);
+
+function maskEmail(email) {
+  if (!email || typeof email !== "string" || !email.includes("@")) return email;
+  const [user, domain] = email.split("@");
+  if (user.length <= 2) return `*${"*".repeat(user.length)}@${domain}`;
+  return `${user[0]}***${user[user.length - 1]}@${domain}`;
+}
+
+function stripPII(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(stripPII);
+
+  const result = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (PII_KEYS.has(key)) {
+      if (key === "email") {
+        result[key] = maskEmail(val);
+      } else {
+        result[key] = "[redacted]";
+      }
+    } else if (val && typeof val === "object") {
+      result[key] = stripPII(val);
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
+
+// === DIFF LOGIC ===
 
 function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
   if (depth > 4) return changes;
@@ -116,11 +225,11 @@ function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
     if (["created_at", "updated_at", "admin_graphql_api_id"].includes(key)) {
       continue;
     }
-    const next = pathPrefix ? `${pathPrefix}.${key}` : key;
+    const nextPath = pathPrefix ? `${pathPrefix}.${key}` : key;
     diffObjects(
       before ? before[key] : undefined,
       after ? after[key] : undefined,
-      next,
+      nextPath,
       changes,
       depth + 1
     );
@@ -128,6 +237,70 @@ function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
 
   return changes;
 }
+
+// === FRAUD / CARD-TESTING HEURISTIC ===
+
+function getFraudIdentifier(topic, payload) {
+  const email =
+    payload.email ||
+    payload.customer?.email ||
+    payload.billing_address?.email ||
+    payload.shipping_address?.email;
+
+  const ip =
+    payload.client_details?.browser_ip ||
+    payload.client_details?.ip_address ||
+    null;
+
+  const cartToken = payload.cart_token || payload.token || null;
+
+  if (email && ip) return `email:${email}|ip:${ip}`;
+  if (email) return `email:${email}`;
+  if (ip) return `ip:${ip}`;
+  if (cartToken) return `cart:${cartToken}`;
+  return null;
+}
+
+function recordFraudEvent(identifier) {
+  if (!identifier) return;
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000; // 10 minutes
+
+  const existing = fraudTracker.get(identifier) || [];
+  const filtered = existing.filter((t) => now - t < windowMs);
+  filtered.push(now);
+  fraudTracker.set(identifier, filtered);
+  return filtered.length;
+}
+
+function isSuspiciousOrderOrCheckout(topic, payload) {
+  const identifier = getFraudIdentifier(topic, payload);
+  const count = recordFraudEvent(identifier);
+
+  if (!identifier) return false;
+
+  if (topic.startsWith("orders/")) {
+    const financialStatus = (payload.financial_status || "").toLowerCase();
+    const cancelledAt = payload.cancelled_at || null;
+    if (
+      ["voided", "refunded"].includes(financialStatus) ||
+      cancelledAt
+    ) {
+      if (count >= 3) return true;
+    }
+  }
+
+  if (topic.startsWith("checkouts/")) {
+    const status = (payload.status || "").toLowerCase();
+    if (["abandoned", "recovery"].includes(status)) {
+      if (count >= 3) return true;
+    }
+  }
+
+  return false;
+}
+
+// === SLACK ===
 
 async function sendSlack(payload) {
   if (!SLACK_WEBHOOK_URL) return;
@@ -138,7 +311,144 @@ async function sendSlack(payload) {
   });
 }
 
-// --- MAIN HANDLER ---
+function buildDiffBlocks(topic, resourceType, resourceId, shopDomain, payload, previousData) {
+  const changes = diffObjects(previousData, payload);
+  if (!changes.length) return null;
+
+  const isPII = PII_TOPICS.has(topic);
+
+  const diffLines = [];
+  const maxChanges = 12;
+
+  for (const ch of changes.slice(0, maxChanges)) {
+    const beforeVal =
+      "beforeSummary" in ch
+        ? ch.beforeSummary
+        : summarize(isPII ? stripPII(ch.before) : ch.before);
+
+    const afterVal =
+      "afterSummary" in ch
+        ? ch.afterSummary
+        : summarize(isPII ? stripPII(ch.after) : ch.after);
+
+    diffLines.push(
+      `• \`${ch.path}\`:\n    • Before:\n${beforeVal}\n    • After:\n${afterVal}`
+    );
+  }
+
+  if (changes.length > maxChanges) {
+    diffLines.push(`… and ${changes.length - maxChanges} more (truncated)`);
+  }
+
+  const resourceName =
+    payload.title || payload.name || payload.handle || String(resourceId);
+
+  const title = `[${resourceType.toUpperCase()}][${topic
+    .split("/")[1]
+    .toUpperCase()}] ${resourceName}`;
+
+  return {
+    title,
+    attachments: [
+      {
+        color: "#36a64f",
+        fields: [
+          { title: "Category", value: resourceType.toUpperCase(), short: true },
+          { title: "Shop", value: shopDomain, short: true },
+          { title: "Topic", value: topic, short: true },
+          {
+            title: "Resource ID",
+            value: String(resourceId || "Unknown"),
+            short: true,
+          },
+          {
+            title: "Actor",
+            value: "Unknown (no recent events)",
+            short: true,
+          },
+        ],
+      },
+      {
+        color: "#3b88c3",
+        title: "Changes",
+        text: diffLines.join("\n"),
+        mrkdwn_in: ["text"],
+      },
+    ],
+  };
+}
+
+function buildFraudSlackBlocks(topic, resourceType, resourceId, shopDomain, payload) {
+  const email =
+    payload.email ||
+    payload.customer?.email ||
+    payload.billing_address?.email ||
+    payload.shipping_address?.email;
+
+  const ip =
+    payload.client_details?.browser_ip ||
+    payload.client_details?.ip_address ||
+    "Unknown";
+
+  const maskedEmail = maskEmail(email);
+
+  const resourceName =
+    payload.name ||
+    payload.order_number ||
+    payload.cart_token ||
+    String(resourceId);
+
+  const title = `[FRAUD][POSSIBLE CARD TESTING] ${resourceName}`;
+
+  const details = [
+    `• Topic: \`${topic}\``,
+    `• Masked Email: \`${maskedEmail || "Unknown"}\``,
+    `• IP: \`${ip}\``,
+    `• Total Price: ${
+      payload.total_price ||
+      payload.total_price_set?.shop_money?.amount ||
+      "Unknown"
+    }`,
+    `• Gateway: ${
+      payload.gateway ||
+      (Array.isArray(payload.payment_gateway_names)
+        ? payload.payment_gateway_names.join(", ")
+        : "Unknown")
+    }`,
+  ].join("\n");
+
+  return {
+    title,
+    attachments: [
+      {
+        color: "#ff0000",
+        fields: [
+          {
+            title: "Category",
+            value: `${resourceType.toUpperCase()} (FRAUD)`,
+            short: true,
+          },
+          { title: "Shop", value: shopDomain, short: true },
+          { title: "Topic", value: topic, short: true },
+          {
+            title: "Resource ID",
+            value: String(resourceId || "Unknown"),
+            short: true,
+          },
+        ],
+      },
+      {
+        color: "#ff4d4f",
+        title: "Suspicious Activity",
+        text: details,
+        mrkdwn_in: ["text"],
+      },
+    ],
+  };
+}
+
+// === MAIN HANDLER ===
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") {
     res.statusCode = 405;
@@ -173,12 +483,16 @@ module.exports = async (req, res) => {
 
   const { resourceType, action } = parseTopic(topic);
   const resourceId = getResourceId(resourceType, payload);
-  const snapshotKey = buildSnapshotKey(resourceType, resourceId, shopDomain);
+  const snapshotKey = buildSnapshotKey(
+    resourceType,
+    resourceId,
+    shopDomain
+  );
 
   const previousSnapshot = await getSnapshot(snapshotKey);
   const previousData = previousSnapshot ? previousSnapshot.data : null;
 
-  // Always store current snapshot
+  // Always store current snapshot (full payload, including PII)
   await setSnapshot(snapshotKey, {
     shopDomain,
     topic,
@@ -189,23 +503,56 @@ module.exports = async (req, res) => {
     data: payload,
   });
 
-  // *** IMPORTANT: if no previous snapshot, EXIT with NO Slack ***
+  // Fraud detection for orders/checkouts
+  let isFraud = false;
+  if (
+    PII_TOPICS.has(topic) &&
+    (topic.startsWith("orders/") || topic.startsWith("checkouts/"))
+  ) {
+    isFraud = isSuspiciousOrderOrCheckout(topic, payload);
+  }
+
+  // First event (no previous snapshot): use as baseline.
+  // Only send Slack if it's fraud-suspect.
   if (!previousData) {
-    console.log("Baseline snapshot only (no Slack)", {
+    if (isFraud) {
+      const fraudBlocks = buildFraudSlackBlocks(
+        topic,
+        resourceType,
+        resourceId,
+        shopDomain,
+        payload
+      );
+      await sendSlack({
+        text: fraudBlocks.title,
+        attachments: fraudBlocks.attachments,
+      });
+    }
+
+    console.log("Baseline snapshot only", {
       shopDomain,
       topic,
       resourceType,
       resourceId,
     });
+
     res.statusCode = 200;
     return res.end("OK (baseline only)");
   }
 
-  const changes = diffObjects(previousData, payload);
+  // Normal diff
+  const diffBlocks = buildDiffBlocks(
+    topic,
+    resourceType,
+    resourceId,
+    shopDomain,
+    payload,
+    previousData
+  );
 
-  // If nothing actually changed, also do nothing
-  if (!changes.length) {
-    console.log("No meaningful changes, skipping Slack", {
+  // If nothing changed & no fraud, do nothing
+  if (!diffBlocks && !isFraud) {
+    console.log("No meaningful changes", {
       shopDomain,
       topic,
       resourceType,
@@ -215,48 +562,28 @@ module.exports = async (req, res) => {
     return res.end("OK (no changes)");
   }
 
-  // Build Slack message (NO 'New resource – no previous snapshot' anywhere)
-  const diffLines = [];
-  const maxChanges = 12;
-  for (const ch of changes.slice(0, maxChanges)) {
-    const before =
-      "beforeSummary" in ch ? ch.beforeSummary : summarize(ch.before);
-    const after =
-      "afterSummary" in ch ? ch.afterSummary : summarize(ch.after);
-    diffLines.push(
-      `• \`${ch.path}\`:\n    • Before:\n${before}\n    • After:\n${after}`
+  // Send normal diff (if any)
+  if (diffBlocks) {
+    await sendSlack({
+      text: diffBlocks.title,
+      attachments: diffBlocks.attachments,
+    });
+  }
+
+  // Send separate fraud alert (if suspected)
+  if (isFraud) {
+    const fraudBlocks = buildFraudSlackBlocks(
+      topic,
+      resourceType,
+      resourceId,
+      shopDomain,
+      payload
     );
+    await sendSlack({
+      text: fraudBlocks.title,
+      attachments: fraudBlocks.attachments,
+    });
   }
-  if (changes.length > maxChanges) {
-    diffLines.push(`… and ${changes.length - maxChanges} more (truncated)`);
-  }
-
-  const title = `[${resourceType.toUpperCase()}][${action.toUpperCase()}]`;
-  const resourceName =
-    payload.title || payload.name || payload.handle || String(resourceId);
-
-  const slackPayload = {
-    text: `${title} ${resourceName}`,
-    attachments: [
-      {
-        color: "#36a64f",
-        fields: [
-          { title: "Category", value: resourceType.toUpperCase(), short: true },
-          { title: "Shop", value: shopDomain, short: true },
-          { title: "Topic", value: topic, short: true },
-          { title: "Resource ID", value: String(resourceId || "Unknown"), short: true },
-        ],
-      },
-      {
-        color: "#3b88c3",
-        title: "Changes",
-        text: diffLines.join("\n"),
-        mrkdwn_in: ["text"],
-      },
-    ],
-  };
-
-  await sendSlack(slackPayload);
 
   res.statusCode = 200;
   res.end("OK");
