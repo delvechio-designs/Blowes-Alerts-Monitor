@@ -1,6 +1,7 @@
 // api/blowes-alerts-monitor.js
 // Shopify → Vercel → Slack monitoring & anomaly detection
-// Focus: card testing / fraud, plus other "super important" anomalies only
+// Focus: card testing / fraud + important anomalies only.
+// Inventory going to 0 is now ONLY logged, NOT sent to Slack.
 
 import crypto from "crypto";
 
@@ -310,7 +311,9 @@ function detectPriceAnomaly(before, after) {
   return changes.length ? changes : null;
 }
 
-// 3) Inventory wiped / large jumps
+// 3) Inventory anomalies
+// NOTE: items going to zero are now ignored for Slack alerts.
+// Only *big jumps* (±100+) are treated as anomalies.
 function detectInventoryAnomaly(before, after) {
   if (!before || !after || !Array.isArray(before.variants)) return null;
 
@@ -329,14 +332,14 @@ function detectInventoryAnomaly(before, after) {
     if (oldQty == null || newQty == null) continue;
     const delta = newQty - oldQty;
 
+    // ✅ Do NOT treat zero-stock as a Slack anomaly anymore.
     if (oldQty > 0 && newQty === 0) {
-      issues.push({
-        variantId: vAfter.id,
-        type: "to_zero",
-        oldQty,
-        newQty,
-      });
-    } else if (Math.abs(delta) >= 100) {
+      // Still stored in snapshot, but no Slack signal.
+      continue;
+    }
+
+    // Only flag large jumps
+    if (Math.abs(delta) >= 100) {
       issues.push({
         variantId: vAfter.id,
         type: "big_jump",
@@ -356,8 +359,6 @@ function detectDiscountAnomaly(discount) {
 
   const anomalies = [];
 
-  // classic % discount
-  const val = discount.value || discount.valueV2 || discount.value_type;
   const percentage = discount.value
     ? parseFloat(discount.value)
     : discount.value_type === "percentage"
@@ -402,6 +403,7 @@ async function handleProductUpdate(payload, context) {
   const priceAnoms = detectPriceAnomaly(previous, payload);
   const invAnoms = detectInventoryAnomaly(previous, payload);
 
+  // invAnoms now only contains big jumps (no "to_zero")
   if (!priceAnoms && !invAnoms) return;
 
   const fields = [];
@@ -416,9 +418,6 @@ async function handleProductUpdate(payload, context) {
 
   if (invAnoms && invAnoms.length) {
     const lines = invAnoms.map((i) => {
-      if (i.type === "to_zero") {
-        return `• Variant ${i.variantId}: inventory ${i.oldQty} → 0`;
-      }
       return `• Variant ${i.variantId}: inventory ${i.oldQty} → ${i.newQty} (Δ ${i.delta})`;
     });
     fields.push(buildField("Inventory anomalies", lines.join("\n")));
@@ -535,7 +534,9 @@ async function handleCheckoutUpdate(payload, context) {
 
   // A simple hash of line items so we can see repeated cart content
   const lineHash = hashValue(
-    (payload.line_items || []).map((li) => `${li.sku || li.title}:${li.quantity}`).join("|")
+    (payload.line_items || [])
+      .map((li) => `${li.sku || li.title}:${li.quantity}`)
+      .join("|")
   );
 
   const entry = {
@@ -645,7 +646,8 @@ async function handleContentUpdate(payload, context, typeLabel, idField = "id") 
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*Detected a large reduction in content. This may hurt SEO or break page layout.*",
+        text:
+          "*Detected a large reduction in content. This may hurt SEO or break page layout.*",
       },
     },
     buildSlackDivider(),
@@ -692,7 +694,10 @@ export default async function handler(req, res) {
     .update(rawBody)
     .digest("base64");
 
-  if (!hmacHeader || !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader))) {
+  if (
+    !hmacHeader ||
+    !crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader))
+  ) {
     console.warn("Invalid HMAC for webhook", { shopDomain, topic });
     res.status(401).send("Invalid HMAC");
     return;
