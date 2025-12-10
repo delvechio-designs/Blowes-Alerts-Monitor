@@ -1,26 +1,28 @@
 // api/blowes-alerts-monitor.js
-// Shopify monitor with:
-// - Baseline snapshots (no Slack on first event unless fraud)
-// - Before/After diffs for all resources
-// - Full payloads stored in memory (PII included)
-// - PII masked in Slack for normal events
-// - Extra fraud/card-testing heuristic for orders & checkouts
+// Shopify monitor that:
+// - Tracks ALL webhooks and stores full snapshots (including PII) in memory
+// - Only sends Slack alerts for anomalies / critical events:
+//     * Suspected card testing / abusive checkout patterns (orders/checkouts)
+//     * app/uninstalled
+//     * themes/publish
+// - Masks PII in Slack messages
 
 const crypto = require("crypto");
 
-// === CONFIG ===
+// === CONFIG (from Vercel env vars) ===
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || null;
 
-// In-memory snapshot store (swap to KV later if you want persistence)
+// === In-memory stores (can be swapped to KV later) ===
+
+// Full snapshots keyed by shop + resource id
 const snapshotStore = new Map();
 
-// In-memory fraud tracker
-// Key: identifier (email|ip|cart_token)
-// Value: array of timestamps (ms)
+// Simple rolling fraud tracker keyed by email/ip/cart_token
+// value: array of timestamps (ms) of suspicious-ish events
 const fraudTracker = new Map();
 
-// Topics where payloads contain heavy PII:
+// Topics with significant PII in payloads
 const PII_TOPICS = new Set([
   "orders/create",
   "orders/updated",
@@ -32,27 +34,10 @@ const PII_TOPICS = new Set([
   "customers/update",
 ]);
 
-// (Optional grouping; not strictly needed but kept for clarity)
-const CONTENT_TOPICS = new Set([
-  "products/create",
-  "products/update",
-  "products/delete",
-  "collections/create",
-  "collections/update",
-  "collections/delete",
-  "pages/create",
-  "pages/update",
-  "pages/delete",
-  "articles/create",
-  "articles/update",
-  "articles/delete",
-  "themes/publish",
-  "themes/update",
-  "inventory_levels/update",
-  "discounts/create",
-  "discounts/update",
-  "discounts/delete",
+// Critical, non-fraud events we ALWAYS want to see
+const CRITICAL_TOPICS = new Set([
   "app/uninstalled",
+  "themes/publish",
 ]);
 
 // === SNAPSHOT HELPERS ===
@@ -183,7 +168,7 @@ function stripPII(obj) {
   return result;
 }
 
-// === DIFF LOGIC ===
+// === DIFF LOGIC (still used for critical events if you want it later) ===
 
 function diffObjects(before, after, pathPrefix = "", changes = [], depth = 0) {
   if (depth > 4) return changes;
@@ -262,7 +247,7 @@ function getFraudIdentifier(topic, payload) {
 }
 
 function recordFraudEvent(identifier) {
-  if (!identifier) return;
+  if (!identifier) return 0;
   const now = Date.now();
   const windowMs = 10 * 60 * 1000; // 10 minutes
 
@@ -279,6 +264,9 @@ function isSuspiciousOrderOrCheckout(topic, payload) {
 
   if (!identifier) return false;
 
+  // Simple heuristic:
+  // - orders: lots of voided/refunded/cancelled in short window
+  // - checkouts: many abandoned/recovery statuses in short window
   if (topic.startsWith("orders/")) {
     const financialStatus = (payload.financial_status || "").toLowerCase();
     const cancelledAt = payload.cancelled_at || null;
@@ -300,7 +288,7 @@ function isSuspiciousOrderOrCheckout(topic, payload) {
   return false;
 }
 
-// === SLACK ===
+// === SLACK HELPERS ===
 
 async function sendSlack(payload) {
   if (!SLACK_WEBHOOK_URL) return;
@@ -311,74 +299,7 @@ async function sendSlack(payload) {
   });
 }
 
-function buildDiffBlocks(topic, resourceType, resourceId, shopDomain, payload, previousData) {
-  const changes = diffObjects(previousData, payload);
-  if (!changes.length) return null;
-
-  const isPII = PII_TOPICS.has(topic);
-
-  const diffLines = [];
-  const maxChanges = 12;
-
-  for (const ch of changes.slice(0, maxChanges)) {
-    const beforeVal =
-      "beforeSummary" in ch
-        ? ch.beforeSummary
-        : summarize(isPII ? stripPII(ch.before) : ch.before);
-
-    const afterVal =
-      "afterSummary" in ch
-        ? ch.afterSummary
-        : summarize(isPII ? stripPII(ch.after) : ch.after);
-
-    diffLines.push(
-      `• \`${ch.path}\`:\n    • Before:\n${beforeVal}\n    • After:\n${afterVal}`
-    );
-  }
-
-  if (changes.length > maxChanges) {
-    diffLines.push(`… and ${changes.length - maxChanges} more (truncated)`);
-  }
-
-  const resourceName =
-    payload.title || payload.name || payload.handle || String(resourceId);
-
-  const title = `[${resourceType.toUpperCase()}][${topic
-    .split("/")[1]
-    .toUpperCase()}] ${resourceName}`;
-
-  return {
-    title,
-    attachments: [
-      {
-        color: "#36a64f",
-        fields: [
-          { title: "Category", value: resourceType.toUpperCase(), short: true },
-          { title: "Shop", value: shopDomain, short: true },
-          { title: "Topic", value: topic, short: true },
-          {
-            title: "Resource ID",
-            value: String(resourceId || "Unknown"),
-            short: true,
-          },
-          {
-            title: "Actor",
-            value: "Unknown (no recent events)",
-            short: true,
-          },
-        ],
-      },
-      {
-        color: "#3b88c3",
-        title: "Changes",
-        text: diffLines.join("\n"),
-        mrkdwn_in: ["text"],
-      },
-    ],
-  };
-}
-
-function buildFraudSlackBlocks(topic, resourceType, resourceId, shopDomain, payload) {
+function buildFraudSlackPayload(topic, resourceType, resourceId, shopDomain, payload) {
   const email =
     payload.email ||
     payload.customer?.email ||
@@ -418,7 +339,7 @@ function buildFraudSlackBlocks(topic, resourceType, resourceId, shopDomain, payl
   ].join("\n");
 
   return {
-    title,
+    text: title,
     attachments: [
       {
         color: "#ff0000",
@@ -444,6 +365,84 @@ function buildFraudSlackBlocks(topic, resourceType, resourceId, shopDomain, payl
         mrkdwn_in: ["text"],
       },
     ],
+  };
+}
+
+function buildCriticalSlackPayload(topic, resourceType, resourceId, shopDomain, payload, previousData) {
+  const resourceName =
+    payload.title || payload.name || payload.handle || String(resourceId);
+
+  // For themes/publish we can optionally show a tiny diff
+  let diffText = "";
+  if (previousData) {
+    const changes = diffObjects(previousData, payload);
+    const lines = [];
+    for (const ch of changes.slice(0, 5)) {
+      const beforeVal =
+        "beforeSummary" in ch ? ch.beforeSummary : summarize(ch.before);
+      const afterVal =
+        "afterSummary" in ch ? ch.afterSummary : summarize(ch.after);
+      lines.push(
+        `• \`${ch.path}\`:\n    • Before:\n${beforeVal}\n    • After:\n${afterVal}`
+      );
+    }
+    if (changes.length > 5) {
+      lines.push(`… and ${changes.length - 5} more (truncated)`);
+    }
+    diffText = lines.join("\n");
+  }
+
+  let title;
+  if (topic === "app/uninstalled") {
+    title = `[APP][UNINSTALLED] ${resourceName}`;
+  } else if (topic === "themes/publish") {
+    title = `[THEME][PUBLISH] ${resourceName}`;
+  } else {
+    title = `[CRITICAL][${resourceType.toUpperCase()}] ${resourceName}`;
+  }
+
+  const baseFields = [
+    {
+      title: "Category",
+      value: resourceType.toUpperCase(),
+      short: true,
+    },
+    {
+      title: "Shop",
+      value: shopDomain,
+      short: true,
+    },
+    {
+      title: "Topic",
+      value: topic,
+      short: true,
+    },
+    {
+      title: "Resource ID",
+      value: String(resourceId || "Unknown"),
+      short: true,
+    },
+  ];
+
+  const attachments = [
+    {
+      color: topic === "app/uninstalled" ? "#e74c3c" : "#f1c40f",
+      fields: baseFields,
+    },
+  ];
+
+  if (diffText) {
+    attachments.push({
+      color: "#3b88c3",
+      title: "Changes",
+      text: diffText,
+      mrkdwn_in: ["text"],
+    });
+  }
+
+  return {
+    text: title,
+    attachments,
   };
 }
 
@@ -492,7 +491,7 @@ module.exports = async (req, res) => {
   const previousSnapshot = await getSnapshot(snapshotKey);
   const previousData = previousSnapshot ? previousSnapshot.data : null;
 
-  // Always store current snapshot (full payload, including PII)
+  // Always store the latest snapshot (full payload, PII included)
   await setSnapshot(snapshotKey, {
     shopDomain,
     topic,
@@ -503,85 +502,81 @@ module.exports = async (req, res) => {
     data: payload,
   });
 
-  // Fraud detection for orders/checkouts
-  let isFraud = false;
-  if (
+  // Determine anomaly / critical flags
+  const isFraudCandidate =
     PII_TOPICS.has(topic) &&
-    (topic.startsWith("orders/") || topic.startsWith("checkouts/"))
-  ) {
-    isFraud = isSuspiciousOrderOrCheckout(topic, payload);
-  }
+    (topic.startsWith("orders/") || topic.startsWith("checkouts/"));
 
-  // First event (no previous snapshot): use as baseline.
-  // Only send Slack if it's fraud-suspect.
+  const isFraud = isFraudCandidate
+    ? isSuspiciousOrderOrCheckout(topic, payload)
+    : false;
+
+  const isCriticalEvent = CRITICAL_TOPICS.has(topic);
+
+  // Baseline: first time we see this resource
   if (!previousData) {
+    // On first event, only alert if it's fraud or critical
     if (isFraud) {
-      const fraudBlocks = buildFraudSlackBlocks(
+      const fraudPayload = buildFraudSlackPayload(
         topic,
         resourceType,
         resourceId,
         shopDomain,
         payload
       );
-      await sendSlack({
-        text: fraudBlocks.title,
-        attachments: fraudBlocks.attachments,
+      await sendSlack(fraudPayload);
+    } else if (isCriticalEvent) {
+      const critPayload = buildCriticalSlackPayload(
+        topic,
+        resourceType,
+        resourceId,
+        shopDomain,
+        payload,
+        null
+      );
+      await sendSlack(critPayload);
+    } else {
+      console.log("Baseline snapshot only (no Slack)", {
+        shopDomain,
+        topic,
+        resourceType,
+        resourceId,
       });
     }
 
-    console.log("Baseline snapshot only", {
-      shopDomain,
-      topic,
-      resourceType,
-      resourceId,
-    });
-
     res.statusCode = 200;
-    return res.end("OK (baseline only)");
+    return res.end("OK (baseline)");
   }
 
-  // Normal diff
-  const diffBlocks = buildDiffBlocks(
-    topic,
-    resourceType,
-    resourceId,
-    shopDomain,
-    payload,
-    previousData
-  );
-
-  // If nothing changed & no fraud, do nothing
-  if (!diffBlocks && !isFraud) {
-    console.log("No meaningful changes", {
-      shopDomain,
-      topic,
-      resourceType,
-      resourceId,
-    });
-    res.statusCode = 200;
-    return res.end("OK (no changes)");
-  }
-
-  // Send normal diff (if any)
-  if (diffBlocks) {
-    await sendSlack({
-      text: diffBlocks.title,
-      attachments: diffBlocks.attachments,
-    });
-  }
-
-  // Send separate fraud alert (if suspected)
+  // For subsequent events:
+  // - If fraud: send fraud alert.
+  // - Else if critical (app uninstall, theme publish): send critical alert.
+  // - Else: NO Slack (just store snapshot silently).
   if (isFraud) {
-    const fraudBlocks = buildFraudSlackBlocks(
+    const fraudPayload = buildFraudSlackPayload(
       topic,
       resourceType,
       resourceId,
       shopDomain,
       payload
     );
-    await sendSlack({
-      text: fraudBlocks.title,
-      attachments: fraudBlocks.attachments,
+    await sendSlack(fraudPayload);
+  } else if (isCriticalEvent) {
+    const critPayload = buildCriticalSlackPayload(
+      topic,
+      resourceType,
+      resourceId,
+      shopDomain,
+      payload,
+      previousData
+    );
+    await sendSlack(critPayload);
+  } else {
+    console.log("Non-critical change stored silently", {
+      shopDomain,
+      topic,
+      resourceType,
+      resourceId,
     });
   }
 
