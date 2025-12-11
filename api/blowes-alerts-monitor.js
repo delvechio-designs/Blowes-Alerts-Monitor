@@ -2,7 +2,8 @@
 // Shopify → Vercel → Slack monitoring & anomaly detection
 // Focus: card testing / fraud + important anomalies only.
 // Inventory going to 0 is only logged (no Slack).
-// Theme template inspector added: detects removed custom-liquid / big template shrink.
+// Theme template inspector detects removed custom-liquid / big template shrink.
+// John Doe + Flushing NY 11354 + yopmail abandoned checkouts get explicit fraud alerts with raw IP.
 
 import crypto from "crypto";
 
@@ -21,7 +22,6 @@ const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const SHOPIFY_API_VERSION = "2025-01";
 
 // Critical templates we want to watch for nuked sections (especially PDP).
-// You can add/remove keys here as needed.
 const CRITICAL_THEME_TEMPLATES = [
   "templates/product.json",
   "templates/product.main.json",
@@ -180,6 +180,7 @@ function diffObjects(before, after) {
     const bStr = safeJson(b);
     const aStr = safeJson(a);
     if (bStr !== aStr) {
+      changes[key] = { before, after };
       changes[key] = { before: b, after: a };
     }
   }
@@ -204,7 +205,7 @@ function formatChangesForSlack(changes) {
 
 // ---------- ANOMALY DETECTORS ----------
 
-// 1) Card testing / checkout surge
+// 1) Card testing / checkout surge (generic)
 function detectCheckoutAnomaly(newEntry) {
   pruneRecentCheckouts();
   recentCheckouts.push(newEntry);
@@ -215,7 +216,6 @@ function detectCheckoutAnomaly(newEntry) {
 
   const totalInWindow = windowEntries.length;
 
-  // Basic global surge
   const GLOBAL_THRESHOLD = 10; // 10+ checkouts in 15 min
   const GLOBAL_BURST_THRESHOLD = 5; // 5+ checkouts in 3 min
   const shortWindowMs = 3 * 60 * 1000;
@@ -276,7 +276,6 @@ function detectCheckoutAnomaly(newEntry) {
       : `Repeated cart amount $${domAmount} (${domAmountCount} checkouts).`;
   }
 
-  // If we found *any* strong reason, treat as anomaly
   if (!reason) return null;
 
   return {
@@ -287,7 +286,7 @@ function detectCheckoutAnomaly(newEntry) {
   };
 }
 
-// 2) Big price spikes / drops (per resource diff)
+// 2) Big price spikes / drops
 function detectPriceAnomaly(before, after) {
   if (!before || !after || !Array.isArray(before.variants)) return null;
 
@@ -320,9 +319,7 @@ function detectPriceAnomaly(before, after) {
   return changes.length ? changes : null;
 }
 
-// 3) Inventory anomalies
-// NOTE: items going to zero are now ignored for Slack alerts.
-// Only *big jumps* (±100+) are treated as anomalies.
+// 3) Inventory anomalies (big jumps only)
 function detectInventoryAnomaly(before, after) {
   if (!before || !after || !Array.isArray(before.variants)) return null;
 
@@ -389,7 +386,6 @@ function detectDiscountAnomaly(discount) {
 
 // ---------- THEME TEMPLATE INSPECTION ----------
 
-// Fetch a single asset's value (string) from the Shopify Admin API.
 async function fetchThemeAssetValue(shopDomain, themeId, assetKey) {
   if (!SHOPIFY_ADMIN_TOKEN) return null;
 
@@ -405,7 +401,12 @@ async function fetchThemeAssetValue(shopDomain, themeId, assetKey) {
   });
 
   if (!res.ok) {
-    console.warn("Failed to fetch theme asset", { shopDomain, themeId, assetKey, status: res.status });
+    console.warn("Failed to fetch theme asset", {
+      shopDomain,
+      themeId,
+      assetKey,
+      status: res.status,
+    });
     return null;
   }
 
@@ -417,7 +418,6 @@ async function fetchThemeAssetValue(shopDomain, themeId, assetKey) {
   return json.asset.value;
 }
 
-// Detect if template shrank a lot or lost "custom-liquid".
 function detectThemeTemplateRemoval(prevStr, currStr) {
   if (!prevStr || !currStr) return null;
 
@@ -441,7 +441,6 @@ function detectThemeTemplateRemoval(prevStr, currStr) {
   return notes.length ? { prevLen, currLen, notes } : null;
 }
 
-// For a given theme, inspect critical templates for nuked/changed content.
 async function inspectThemeTemplates(themePayload, context) {
   if (!SHOPIFY_ADMIN_TOKEN) return [];
 
@@ -450,7 +449,11 @@ async function inspectThemeTemplates(themePayload, context) {
   const results = [];
 
   for (const assetKey of CRITICAL_THEME_TEMPLATES) {
-    const currentValue = await fetchThemeAssetValue(shopDomain, themeId, assetKey);
+    const currentValue = await fetchThemeAssetValue(
+      shopDomain,
+      themeId,
+      assetKey
+    );
     if (!currentValue) continue;
 
     const snapshotId = `${themeId}:${assetKey}`;
@@ -476,14 +479,90 @@ async function inspectThemeTemplates(themePayload, context) {
   return results;
 }
 
-// 5) Theme publish / file edits (always "important")
 function isImportantThemeEvent(themePayload) {
   return !!themePayload;
 }
 
+// ---------- SUSPICIOUS IDENTITY / JOHN DOE CHECK ----------
+
+function isDisposableEmail(email) {
+  if (!email) return false;
+  const lower = email.toLowerCase();
+  // You can add more disposable providers here if you want.
+  return lower.includes("@yopmail.");
+}
+
+function detectSuspiciousCheckoutIdentity(payload, browserIp) {
+  const billing = payload.billing_address || {};
+  const shipping = payload.shipping_address || {};
+  const customer = payload.customer || {};
+
+  const first =
+    billing.first_name ||
+    shipping.first_name ||
+    customer.first_name ||
+    "";
+  const last =
+    billing.last_name ||
+    shipping.last_name ||
+    customer.last_name ||
+    "";
+  const fullName = `${first} ${last}`.trim().toLowerCase();
+
+  const city = (billing.city || shipping.city || "").toLowerCase();
+  const zip = (billing.zip || shipping.zip || "").trim();
+  const country = (billing.country || shipping.country || "").toLowerCase();
+  const province = (billing.province || shipping.province || "").toLowerCase();
+  const provinceCode = (
+    billing.province_code ||
+    shipping.province_code ||
+    ""
+  ).toLowerCase();
+
+  const email = payload.email || customer.email || null;
+
+  const isJohnDoe = fullName === "john doe";
+  const isFlushing = city === "flushing" && zip === "11354";
+  const isUS =
+    country === "united states" ||
+    country === "united states of america" ||
+    country === "usa" ||
+    country === "us";
+  const isNY = province === "new york" || provinceCode === "ny";
+
+  const hasYopmail = isDisposableEmail(email);
+
+  const reasons = [];
+
+  if (isJohnDoe && isFlushing && isUS && isNY) {
+    reasons.push("Exact John Doe + Flushing NY 11354 US pattern");
+  }
+  if (hasYopmail) {
+    reasons.push("Disposable email domain (yopmail)");
+  }
+
+  // You can expand this later if you want to catch
+  // "John Doe" anywhere in US, or other cities.
+  if (!reasons.length) return null;
+
+  return {
+    email,
+    firstName: first,
+    lastName: last,
+    fullName,
+    city,
+    zip,
+    country,
+    province,
+    provinceCode,
+    browserIp: browserIp || null,
+    reasons,
+  };
+}
+
 // ---------- HANDLERS FOR TOPICS ----------
 
-// Products: only alert if *important anomaly* (price/inventory)
+// Products
 async function handleProductUpdate(payload, context) {
   const productId = payload.id;
   const type = "product";
@@ -540,7 +619,7 @@ async function handleProductUpdate(payload, context) {
   await sendSlackMessage(blocks);
 }
 
-// Discounts: only "high-risk" anomalies
+// Discounts
 async function handleDiscountUpdate(payload, context) {
   const discountId = payload.id || payload.discount_id;
   const type = "discount";
@@ -577,7 +656,7 @@ async function handleDiscountUpdate(payload, context) {
   await sendSlackMessage(blocks);
 }
 
-// Themes: always important + inspect templates
+// Themes
 async function handleThemeEvent(payload, context) {
   if (!isImportantThemeEvent(payload)) return;
 
@@ -620,9 +699,9 @@ async function handleThemeEvent(payload, context) {
   await sendSlackMessage(blocks);
 }
 
-// Checkouts: card testing & fraud anomaly logic
+// Checkouts: fraud & John Doe detection
 async function handleCheckoutUpdate(payload, context) {
-  // Only care about incomplete / abandoned-type ones
+  // Only care about incomplete / abandoned-type ones here
   if (payload.completed_at) {
     return;
   }
@@ -661,6 +740,80 @@ async function handleCheckoutUpdate(payload, context) {
     lineHash,
   };
 
+  // 1) Specific John Doe / Yopmail / Flushing NY pattern detection
+  const suspiciousIdentity = detectSuspiciousCheckoutIdentity(
+    payload,
+    browserIp
+  );
+  if (suspiciousIdentity) {
+    const {
+      email: suspEmail,
+      firstName,
+      lastName,
+      city,
+      zip,
+      country,
+      province,
+      provinceCode,
+      browserIp: suspIp,
+      reasons,
+    } = suspiciousIdentity;
+
+    const addrSummary = `${city || "(no city)"}, ${province || provinceCode || "(no state)"} ${zip || ""}, ${country || "(no country)"}`.trim();
+
+    const blocks = [
+      buildSlackHeader("[FRAUD][SUSPECT ABANDONED CHECKOUT – JOHN DOE PATTERN]", "🚨"),
+      {
+        type: "section",
+        fields: [
+          buildField("Category", "CHECKOUT / FRAUD"),
+          buildField("Topic", context.topic),
+          buildField("Shop", context.shopDomain),
+        ],
+      },
+      buildSlackDivider(),
+      {
+        type: "section",
+        fields: [
+          buildField(
+            "Name",
+            `${firstName || ""} ${lastName || ""}`.trim() || "(unknown)"
+          ),
+          buildField("Email", suspEmail || "(none)"),
+        ],
+      },
+      {
+        type: "section",
+        fields: [
+          buildField("IP (raw)", suspIp || "(none)"),
+          buildField("Address (summary)", addrSummary || "(none)"),
+        ],
+      },
+      buildSlackDivider(),
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            "*Detection reasons:*\n" +
+            reasons.map((r) => `• ${r}`).join("\n"),
+        },
+      },
+      buildSlackDivider(),
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            "_This alert intentionally includes PII (IP, email, name, address) for fraud investigation of a known bad pattern (John Doe / disposable email abandoned carts)._",
+        },
+      },
+    ];
+
+    await sendSlackMessage(blocks);
+  }
+
+  // 2) Generic card-testing / surge anomaly (still hashed PII)
   const anomaly = detectCheckoutAnomaly(entry);
   if (!anomaly) return;
 
@@ -700,8 +853,8 @@ async function handleCheckoutUpdate(payload, context) {
         type: "mrkdwn",
         text:
           "*Privacy Note:*\n" +
-          "Email, name and IP are *hashed* internally for anomaly grouping. " +
-          "No raw PII is printed here. Use this alert as a signal to inspect Shopify's Abandoned Checkouts directly.",
+          "For generic anomalies, email, name and IP are *hashed* internally for grouping. " +
+          "Use this alert as a signal to inspect Abandoned Checkouts in Shopify directly.",
       },
     },
   ];
@@ -709,7 +862,7 @@ async function handleCheckoutUpdate(payload, context) {
   await sendSlackMessage(blocks);
 }
 
-// For other content types (pages, collections, blog posts, etc.)
+// Content (pages, collections, articles)
 async function handleContentUpdate(payload, context, typeLabel, idField = "id") {
   const resourceId = payload[idField];
   const type = typeLabel.toLowerCase();
@@ -731,7 +884,7 @@ async function handleContentUpdate(payload, context, typeLabel, idField = "id") 
 
   let isBigChange = false;
   if (beforeLen && afterLen < beforeLen * 0.2) {
-    isBigChange = true; // page/article massively shortened → potential SEO break
+    isBigChange = true;
   }
 
   if (!isBigChange) return;
@@ -855,7 +1008,7 @@ export default async function handler(req, res) {
         break;
 
       default:
-        // For any topic we don't explicitly handle, just store snapshot and move on silently.
+        // Unhandled topics: snapshots/logging only if you wire it up separately.
         break;
     }
   } catch (err) {
