@@ -1,7 +1,8 @@
 // api/blowes-alerts-monitor.js
 // Shopify → Vercel → Slack monitoring & anomaly detection
 // Focus: card testing / fraud + important anomalies only.
-// Inventory going to 0 is now ONLY logged, NOT sent to Slack.
+// Inventory going to 0 is only logged (no Slack).
+// Theme template inspector added: detects removed custom-liquid / big template shrink.
 
 import crypto from "crypto";
 
@@ -15,9 +16,21 @@ const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
+// Admin API token for theme asset inspection (read_themes).
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_API_VERSION = "2025-01";
+
+// Critical templates we want to watch for nuked sections (especially PDP).
+// You can add/remove keys here as needed.
+const CRITICAL_THEME_TEMPLATES = [
+  "templates/product.json",
+  "templates/product.main.json",
+  "templates/product.alternate.json",
+];
+
 // ---------- SIMPLE SNAPSHOT STORAGE ----------
 
-// Keys look like: product:1234567890
+// Keys look like: product:1234567890  or  theme_asset:123456:templates/product.json
 const localSnapshots = new Map();
 
 async function kvGet(key) {
@@ -118,9 +131,6 @@ function buildField(label, value) {
 
 // ---------- ANOMALY STATE (in-memory windows) ----------
 
-// We use in-memory windows for anomalies (warm lambda).
-// This is fine for short fraud windows and avoids heavy infra.
-
 const recentCheckouts = []; // { timestamp, emailHash, amount, ip, nameHash, lineHash }
 const RECENT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 
@@ -146,7 +156,7 @@ function pruneRecentCheckouts() {
   }
 }
 
-// ---------- DIFF HELPER FOR SNAPSHOTS ----------
+// ---------- DIFF HELPERS ----------
 
 function diffObjects(before, after) {
   if (!before || !after) return null;
@@ -269,7 +279,6 @@ function detectCheckoutAnomaly(newEntry) {
   // If we found *any* strong reason, treat as anomaly
   if (!reason) return null;
 
-  // Build summarised statistics for Slack
   return {
     reason,
     totalInWindow,
@@ -332,13 +341,11 @@ function detectInventoryAnomaly(before, after) {
     if (oldQty == null || newQty == null) continue;
     const delta = newQty - oldQty;
 
-    // ✅ Do NOT treat zero-stock as a Slack anomaly anymore.
+    // Zero stock is logged via snapshot, but not treated as a Slack anomaly.
     if (oldQty > 0 && newQty === 0) {
-      // Still stored in snapshot, but no Slack signal.
       continue;
     }
 
-    // Only flag large jumps
     if (Math.abs(delta) >= 100) {
       issues.push({
         variantId: vAfter.id,
@@ -380,6 +387,95 @@ function detectDiscountAnomaly(discount) {
   return anomalies.length ? anomalies : null;
 }
 
+// ---------- THEME TEMPLATE INSPECTION ----------
+
+// Fetch a single asset's value (string) from the Shopify Admin API.
+async function fetchThemeAssetValue(shopDomain, themeId, assetKey) {
+  if (!SHOPIFY_ADMIN_TOKEN) return null;
+
+  const url = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/themes/${themeId}/assets.json?asset[key]=${encodeURIComponent(
+    assetKey
+  )}`;
+
+  const res = await fetch(url, {
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    console.warn("Failed to fetch theme asset", { shopDomain, themeId, assetKey, status: res.status });
+    return null;
+  }
+
+  const json = await res.json().catch(() => null);
+  if (!json || !json.asset || typeof json.asset.value !== "string") {
+    return null;
+  }
+
+  return json.asset.value;
+}
+
+// Detect if template shrank a lot or lost "custom-liquid".
+function detectThemeTemplateRemoval(prevStr, currStr) {
+  if (!prevStr || !currStr) return null;
+
+  const prevLen = prevStr.length;
+  const currLen = currStr.length;
+  const notes = [];
+
+  if (prevLen && currLen < prevLen * 0.8) {
+    notes.push(
+      `Template content shrank from ${prevLen} chars to ${currLen} chars.`
+    );
+  }
+
+  const prevHasCustom = prevStr.includes("custom-liquid");
+  const currHasCustom = currStr.includes("custom-liquid");
+
+  if (prevHasCustom && !currHasCustom) {
+    notes.push("custom-liquid section reference was removed from this template.");
+  }
+
+  return notes.length ? { prevLen, currLen, notes } : null;
+}
+
+// For a given theme, inspect critical templates for nuked/changed content.
+async function inspectThemeTemplates(themePayload, context) {
+  if (!SHOPIFY_ADMIN_TOKEN) return [];
+
+  const shopDomain = context.shopDomain;
+  const themeId = themePayload.id;
+  const results = [];
+
+  for (const assetKey of CRITICAL_THEME_TEMPLATES) {
+    const currentValue = await fetchThemeAssetValue(shopDomain, themeId, assetKey);
+    if (!currentValue) continue;
+
+    const snapshotId = `${themeId}:${assetKey}`;
+    const previousSnapshot = await loadSnapshot("theme_asset", snapshotId);
+    await saveSnapshot("theme_asset", snapshotId, { value: currentValue });
+
+    if (previousSnapshot && typeof previousSnapshot.value === "string") {
+      const anomaly = detectThemeTemplateRemoval(
+        previousSnapshot.value,
+        currentValue
+      );
+      if (anomaly) {
+        results.push({
+          assetKey,
+          prevLen: anomaly.prevLen,
+          currLen: anomaly.currLen,
+          notes: anomaly.notes,
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
 // 5) Theme publish / file edits (always "important")
 function isImportantThemeEvent(themePayload) {
   return !!themePayload;
@@ -395,7 +491,6 @@ async function handleProductUpdate(payload, context) {
   const previous = await loadSnapshot(type, productId);
   await saveSnapshot(type, productId, payload);
 
-  // If we have no previous snapshot, DO NOT send Slack (your request)
   if (!previous) {
     return;
   }
@@ -403,7 +498,6 @@ async function handleProductUpdate(payload, context) {
   const priceAnoms = detectPriceAnomaly(previous, payload);
   const invAnoms = detectInventoryAnomaly(previous, payload);
 
-  // invAnoms now only contains big jumps (no "to_zero")
   if (!priceAnoms && !invAnoms) return;
 
   const fields = [];
@@ -483,9 +577,11 @@ async function handleDiscountUpdate(payload, context) {
   await sendSlackMessage(blocks);
 }
 
-// Themes: always important
+// Themes: always important + inspect templates
 async function handleThemeEvent(payload, context) {
   if (!isImportantThemeEvent(payload)) return;
+
+  const templateAnomalies = await inspectThemeTemplates(payload, context);
 
   const blocks = [
     buildSlackHeader(
@@ -502,6 +598,24 @@ async function handleThemeEvent(payload, context) {
       ],
     },
   ];
+
+  if (templateAnomalies && templateAnomalies.length) {
+    const lines = templateAnomalies.map((a) => {
+      const notes = a.notes.map((n) => `  • ${n}`).join("\n");
+      return `• *${a.assetKey}*\n${notes}`;
+    });
+
+    blocks.push(buildSlackDivider());
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          "*Template anomalies detected (possible removed sections / nuked PDP content):*\n" +
+          lines.join("\n\n"),
+      },
+    });
+  }
 
   await sendSlackMessage(blocks);
 }
@@ -532,7 +646,6 @@ async function handleCheckoutUpdate(payload, context) {
   const emailHash = email ? hashValue(email) : "unknown";
   const nameHash = name ? hashValue(name) : "unknown";
 
-  // A simple hash of line items so we can see repeated cart content
   const lineHash = hashValue(
     (payload.line_items || [])
       .map((li) => `${li.sku || li.title}:${li.quantity}`)
@@ -604,14 +717,11 @@ async function handleContentUpdate(payload, context, typeLabel, idField = "id") 
   const previous = await loadSnapshot(type, resourceId);
   await saveSnapshot(type, resourceId, payload);
 
-  // If new and no snapshot → ignore (your request)
   if (!previous) return;
 
   const changes = diffObjects(previous, payload);
   if (!changes) return;
 
-  // We only raise here if the content change is "big enough"
-  // to matter, currently defined as body/content length shrinks a lot.
   const beforeBody =
     previous.body_html || previous.body || previous.content || "";
   const afterBody = payload.body_html || payload.body || payload.content || "";
@@ -676,7 +786,6 @@ export default async function handler(req, res) {
     return;
   }
 
-  // 1) Read raw body
   const rawBody = await new Promise((resolve, reject) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -688,7 +797,6 @@ export default async function handler(req, res) {
   const topic = req.headers["x-shopify-topic"];
   const shopDomain = req.headers["x-shopify-shop-domain"];
 
-  // 2) Validate HMAC
   const digest = crypto
     .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
     .update(rawBody)
@@ -703,7 +811,6 @@ export default async function handler(req, res) {
     return;
   }
 
-  // 3) Parse payload
   let payload;
   try {
     payload = JSON.parse(rawBody.toString("utf8"));
@@ -747,15 +854,12 @@ export default async function handler(req, res) {
         await handleContentUpdate(payload, context, "article", "id");
         break;
 
-      // You can add more topics here if needed.
-
       default:
         // For any topic we don't explicitly handle, just store snapshot and move on silently.
         break;
     }
   } catch (err) {
     console.error("Error handling webhook topic", topic, err);
-    // We still 200 so Shopify doesn't retry forever; but you can log it.
   }
 
   res.status(200).send("OK");
